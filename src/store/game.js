@@ -171,6 +171,8 @@ export const useGameStore = defineStore('game', {
       this.loaded = false
       this.stopEvents()
       await this.load()
+      // 重建新农场的实时通道：否则切换/加入/退出农场后 SSE 一直断开，收不到任何同步广播
+      this.startEvents()
     },
     async createFarm(name) {
       const d = await api('/coop/farms', 'POST', { name })
@@ -185,7 +187,8 @@ export const useGameStore = defineStore('game', {
       return d
     },
     async claimFarm() {
-      await api('/coop/claim', 'POST')
+      const d = await api('/coop/claim', 'POST')
+      if (d?.version != null) this.version = d.version
       await this.restoreMe()
     },
     async leaveFarm() {
@@ -199,27 +202,48 @@ export const useGameStore = defineStore('game', {
       this.stopEvents()
       await this.restoreMe()
       const first = this.myFarms.find((f) => f.status === 'active')
-      this.farmId = first?.id || 1
-      localStorage.setItem(LS_FARM, String(this.farmId))
-      this.loaded = false
+      // 复用 switchFarm：加载新农场并重连实时通道（否则解散后 SSE 保持断开）
+      await this.switchFarm(first?.id || 1)
     },
     async loadCoopDetail() {
       try {
         this.coopDetail = await api('/coop/farms/' + this.farmId)
       } catch { this.coopDetail = null }
     },
+    // 共营变更同步：成员/角色/邀请/转让变化后，刷新存档（含自身角色与权限）、
+    // 成员与邀请列表、我的农场列表；若自己已不在该农场（如在另一标签页退出），
+    // 与「农场被解散」一样切回自己可用的农场
+    async syncCoop() {
+      try {
+        await this.load({ silent: true })
+        await Promise.all([this.loadCoopDetail(), this.restoreMe()])
+      } catch (e) {
+        if (e?.status !== 403) return
+        this.showToast('你已不在该农场成员列表中', 'warn')
+        this.stopEvents()
+        try { await this.restoreMe() } catch { return }
+        const first = this.myFarms.find((f) => f.status === 'active')
+        await this.switchFarm(first?.id || 1).catch(() => {})
+      }
+    },
     async createInvite(role = 'member', maxUses = 1, ttlMs) {
-      return (await api('/coop/invites', 'POST', { role, maxUses, ttlMs })).invite
+      const d = await api('/coop/invites', 'POST', { role, maxUses, ttlMs })
+      if (d?.version != null) this.version = d.version
+      return d.invite
     },
     async revokeInvite(code) {
-      return api('/coop/invites/revoke', 'POST', { code })
+      const d = await api('/coop/invites/revoke', 'POST', { code })
+      if (d?.version != null) this.version = d.version
+      return d
     },
     async setMemberRole(userId, role) {
-      await api('/coop/members/role', 'POST', { userId, role })
+      const d = await api('/coop/members/role', 'POST', { userId, role })
+      if (d?.version != null) this.version = d.version
       await this.loadCoopDetail()
     },
     async transferFarm(userId) {
-      await api('/coop/transfer', 'POST', { userId })
+      const d = await api('/coop/transfer', 'POST', { userId })
+      if (d?.version != null) this.version = d.version
       await Promise.all([this.loadCoopDetail(), this.load()])
     },
 
@@ -249,7 +273,12 @@ export const useGameStore = defineStore('game', {
           }
           // 其他成员的操作：静默同步存档；他人推进时间/育种/加工类变更给出提示
           this.version = d.version
-          this.load({ silent: true })
+          if (COOP_ACTIONS.has(d.action)) {
+            // 共营变更（成员进出/角色/转让/邀请）：还需刷新成员列表、邀请与自身角色权限
+            this.syncCoop()
+          } else {
+            this.load({ silent: true })
+          }
           const byName = d.by?.name ? `（${d.by.name}）` : ''
           this.pushLog(`🔄 ${ACTION_LABELS[d.action] || '农场'}已被同伴更新${byName}`, 'sync')
         } catch { /* ignore */ }
@@ -593,6 +622,12 @@ export const useGameStore = defineStore('game', {
   }
 })
 
+// 共营管理类动作：收到这类广播时，除存档外还需同步成员/邀请/角色权限状态
+const COOP_ACTIONS = new Set([
+  'coop/claim', 'coop/join', 'coop/leave', 'coop/role',
+  'coop/transfer', 'coop/invite', 'coop/inviteRevoke'
+])
+
 // SSE 收到同伴操作时的中文动作名（时间线提示用）
 const ACTION_LABELS = {
   plant: '播种', water: '浇水', fertilize: '施肥', clean: '除虫', harvest: '收获',
@@ -603,7 +638,10 @@ const ACTION_LABELS = {
   'irrigation/priority': '灌溉优先级', 'irrigation/target': '灌溉目标水分',
   'breeding/start': '杂交试验', 'breeding/care': '试验养护', 'breeding/cancel': '取消试验',
   'claims/submit': '灾损申报', 'claims/review': '灾损复核', 'claims/supplement': '灾损补证',
-  upgrade: '建筑升级'
+  upgrade: '建筑升级',
+  'coop/claim': '农场认领', 'coop/join': '新成员加入', 'coop/leave': '成员退出',
+  'coop/role': '成员角色调整', 'coop/transfer': '场主转让',
+  'coop/invite': '邀请码创建', 'coop/inviteRevoke': '邀请码撤销'
 }
 
 // 注入 store 引用给 api() 使用

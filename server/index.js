@@ -73,9 +73,10 @@ app.get('/api/me', (req, res) => {
   if (!s) return res.status(401).json({ error: '未登录' })
   const user = q1('SELECT * FROM users WHERE id=?', s.user_id)
   if (!user) return res.status(401).json({ error: '用户不存在' })
-  // 旧单人存档尚未被任何人认领时，首个 /me 的玩家原子认领成为场主（并发安全）
+  // 旧单人存档尚未被任何人认领时，首个 /me 的玩家原子认领成为场主（并发安全）；
+  // 认领成功即广播：正在预览该存档的其他在线端「待认领」状态与权限预览已过期
   const farm1 = q1('SELECT owner_id FROM farms WHERE id=1')
-  if (farm1 && !farm1.owner_id) claimIfNeeded(1, user.id)
+  if (farm1 && !farm1.owner_id && claimIfNeeded(1, user.id)) broadcastCoop(1, 'coop/claim', user)
   res.json({ user: publicUser(user), farms: listUserFarms(user.id) })
 })
 
@@ -92,13 +93,19 @@ app.post('/api/coop/farms', authUser, (req, res) => {
 
 // 主动认领旧单人存档（登录即可，认领本身正是「从未认领变为场主」的动作，故用 authUser）
 app.post('/api/coop/claim', authUser, (req, res) => {
-  res.json(claimFarm1(req.ctx.user.id))
+  const r = claimFarm1(req.ctx.user.id)
+  // 认领成功：农场新增了场主，通知其他在线端刷新成员与权限状态
+  if (r.claimed) r.version = broadcastCoop(1, 'coop/claim', req.ctx.user, req.get('X-Client-Id'))
+  res.json(r)
 })
 
 // 凭邀请码加入农场（加入者此时还不是成员，只需登录态）
 app.post('/api/coop/join', authUser, (req, res) => {
   try {
-    res.json(joinByCode(req.ctx.user.id, req.body?.code))
+    const r = joinByCode(req.ctx.user.id, req.body?.code)
+    // 新成员加入（或退出成员回归）：广播给农场内其他在线成员
+    r.version = broadcastCoop(r.farmId, 'coop/join', req.ctx.user, req.get('X-Client-Id'))
+    res.json(r)
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message })
   }
@@ -122,7 +129,10 @@ app.get('/api/coop/farms/:id', authContext, (req, res) => {
 // 退出农场（成员/管理员）
 app.post('/api/coop/leave', authContext, (req, res) => {
   try {
-    res.json(leaveFarm(req.ctx.farmId, req.ctx.user.id))
+    const r = leaveFarm(req.ctx.farmId, req.ctx.user.id)
+    // 成员退出：通知其他在线成员更新成员列表（本人在其他标签页的连接收到后会自动切走）
+    r.version = broadcastCoop(req.ctx.farmId, 'coop/leave', req.ctx.user, req.get('X-Client-Id'))
+    res.json(r)
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message })
   }
@@ -136,7 +146,8 @@ app.post('/api/coop/invites', authContext, requirePerm('inviteCreate'), (req, re
       maxUses: req.body?.maxUses,
       ttlMs: req.body?.ttlMs
     })
-    res.json({ ok: true, invite: inv })
+    const version = broadcastCoop(req.ctx.farmId, 'coop/invite', req.ctx.user, req.get('X-Client-Id'))
+    res.json({ ok: true, version, invite: inv })
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message })
   }
@@ -145,7 +156,9 @@ app.post('/api/coop/invites', authContext, requirePerm('inviteCreate'), (req, re
 // 撤销邀请码（管理员+）
 app.post('/api/coop/invites/revoke', authContext, requirePerm('inviteRevoke'), (req, res) => {
   try {
-    res.json(revokeInvite(req.ctx.farmId, req.body?.code))
+    const r = revokeInvite(req.ctx.farmId, req.body?.code)
+    r.version = broadcastCoop(req.ctx.farmId, 'coop/inviteRevoke', req.ctx.user, req.get('X-Client-Id'))
+    res.json(r)
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message })
   }
@@ -154,7 +167,10 @@ app.post('/api/coop/invites/revoke', authContext, requirePerm('inviteRevoke'), (
 // 调整成员角色（场主）
 app.post('/api/coop/members/role', authContext, requirePerm('memberRole'), (req, res) => {
   try {
-    res.json(setMemberRole(req.ctx.farmId, req.ctx.user.id, Number(req.body?.userId), String(req.body?.role || '')))
+    const r = setMemberRole(req.ctx.farmId, req.ctx.user.id, Number(req.body?.userId), String(req.body?.role || ''))
+    // 角色变化直接改变目标成员的权限边界，广播促使其与其他在线端即时刷新
+    r.version = broadcastCoop(req.ctx.farmId, 'coop/role', req.ctx.user, req.get('X-Client-Id'))
+    res.json(r)
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message })
   }
@@ -163,7 +179,10 @@ app.post('/api/coop/members/role', authContext, requirePerm('memberRole'), (req,
 // 转让农场（场主）
 app.post('/api/coop/transfer', authContext, requirePerm('transfer'), (req, res) => {
   try {
-    res.json(transferFarm(req.ctx.farmId, req.ctx.user.id, Number(req.body?.userId)))
+    const r = transferFarm(req.ctx.farmId, req.ctx.user.id, Number(req.body?.userId))
+    // 场主易位：新旧场主的权限立即变化，必须广播同步
+    r.version = broadcastCoop(req.ctx.farmId, 'coop/transfer', req.ctx.user, req.get('X-Client-Id'))
+    res.json(r)
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message })
   }
@@ -210,6 +229,19 @@ function currentVersion(farmId) {
 function bumpVersion(farmId) {
   run('UPDATE farms SET version=version+1 WHERE id=?', farmId)
   return currentVersion(farmId)
+}
+
+// 共营变更广播：成员进出/角色调整/转让/邀请变化后，农场版本 +1 并通知全体在线端。
+// 广播格式与 mutate() 一致（type: 'mutation'），客户端统一处理：
+// 刷新成员与邀请列表、自身角色权限与农场列表，保证权限与成员状态不滞后。
+function broadcastCoop(fid, action, user, clientId = null) {
+  const version = bumpVersion(fid)
+  broadcast(fid, {
+    type: 'mutation', action, version,
+    clientId: clientId || null,
+    by: user ? { id: user.id, name: user.name } : null, at: Date.now()
+  })
+  return version
 }
 
 // 变更接口统一包装：
