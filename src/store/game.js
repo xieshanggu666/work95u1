@@ -171,6 +171,7 @@ export const useGameStore = defineStore('game', {
       this.loaded = false
       this.stopEvents()
       await this.load()
+      this.startEvents() // 切换后重连实时通道，保持新农场多端同步
     },
     async createFarm(name) {
       const d = await api('/coop/farms', 'POST', { name })
@@ -196,12 +197,9 @@ export const useGameStore = defineStore('game', {
     },
     async disbandFarm() {
       await api('/coop/disband', 'POST')
-      this.stopEvents()
       await this.restoreMe()
       const first = this.myFarms.find((f) => f.status === 'active')
-      this.farmId = first?.id || 1
-      localStorage.setItem(LS_FARM, String(this.farmId))
-      this.loaded = false
+      await this.switchFarm(first?.id || 1).catch(() => {})
     },
     async loadCoopDetail() {
       try {
@@ -221,6 +219,37 @@ export const useGameStore = defineStore('game', {
     async transferFarm(userId) {
       await api('/coop/transfer', 'POST', { userId })
       await Promise.all([this.loadCoopDetail(), this.load()])
+    },
+
+    // 其他端发起的共营管理变更（邀请/加入/退出/角色/转让/认领）：
+    // 重拉成员与邀请列表、对齐自身角色权限；自己已退出该农场时跟随切换到仍在团的农场
+    async syncCoop(d) {
+      const myId = this.user?.id
+      if (d.action === 'leave' && d.targetUserId != null && d.targetUserId === myId) {
+        await this.restoreMe().catch(() => {})
+        const first = this.myFarms.find((f) => f.status === 'active')
+        await this.switchFarm(first?.id || 1).catch(() => {})
+        return
+      }
+      const affectsMe = d.targetUserId != null && d.targetUserId === myId
+      try {
+        // 涉及本人或场主变更时，农场清单中的角色也可能变化，一并刷新
+        if (affectsMe || d.action === 'transfer') await this.restoreMe()
+        await this.load({ silent: true })
+        await this.loadCoopDetail()
+      } catch (e) {
+        // 已失去该农场访问权（如旧存档刚被他人认领）：退回自己仍在团的农场
+        if (e.status === 403) {
+          this.stopEvents()
+          await this.restoreMe().catch(() => {})
+          const first = this.myFarms.find((f) => f.status === 'active')
+          if (first) await this.switchFarm(first.id).catch(() => {})
+          this.showToast('该农场成员状态已变化，已切换到可进入的农场', 'warn')
+        }
+        return
+      }
+      const byName = d.by?.name ? `（${d.by.name}）` : ''
+      this.pushLog(`🔄 ${COOP_ACTION_LABELS[d.action] || '成员管理'}已同步${byName}`, 'sync')
     },
 
     // ===== SSE 实时通道 =====
@@ -252,6 +281,14 @@ export const useGameStore = defineStore('game', {
           this.load({ silent: true })
           const byName = d.by?.name ? `（${d.by.name}）` : ''
           this.pushLog(`🔄 ${ACTION_LABELS[d.action] || '农场'}已被同伴更新${byName}`, 'sync')
+        } catch { /* ignore */ }
+      })
+      es.addEventListener('coop', (e) => {
+        try {
+          const d = JSON.parse(e.data)
+          // 本标签页发起的管理操作已在本地处理；其他端（含同账号另一窗口）的变更需要同步
+          if (d.clientId === clientId) return
+          this.syncCoop(d)
         } catch { /* ignore */ }
       })
       es.addEventListener('disbanded', () => {
@@ -604,6 +641,12 @@ const ACTION_LABELS = {
   'breeding/start': '杂交试验', 'breeding/care': '试验养护', 'breeding/cancel': '取消试验',
   'claims/submit': '灾损申报', 'claims/review': '灾损复核', 'claims/supplement': '灾损补证',
   upgrade: '建筑升级'
+}
+
+// SSE 收到共营管理变更时的中文提示（时间线用）
+const COOP_ACTION_LABELS = {
+  join: '新成员加入', leave: '成员退出', memberRole: '成员角色调整', transfer: '场主转让',
+  inviteCreate: '邀请码创建', inviteRevoke: '邀请码撤销', claim: '旧存档认领'
 }
 
 // 注入 store 引用给 api() 使用
